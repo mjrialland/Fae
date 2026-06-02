@@ -1,0 +1,15 @@
+# Object files and build outputs
+*.o
+kernel.bin
+bootloader.efi
+
+# Archive files
+*.tar
+*.zip
+
+# Logs and intermediate files
+*.log
+mycode.txt
+
+# GGUF models (large model files)
+*.gguf
