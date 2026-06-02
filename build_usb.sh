@@ -178,8 +178,11 @@ dd if=/dev/zero of="$TARGET_DEV" bs=1M count=1 conv=fdatasync status=none
 echo "Creating new MBR partition table (Legacy BIOS & UEFI compatible)..."
 parted -s "$TARGET_DEV" mklabel msdos
 
-echo "Creating primary FAT32 partition..."
-parted -s "$TARGET_DEV" mkpart primary fat32 1MiB 100%
+echo "Creating primary boot partition (FAT32, 256MB)..."
+parted -s "$TARGET_DEV" mkpart primary fat32 1MiB 257MiB
+
+echo "Creating primary system partition (FAT32, rest of drive)..."
+parted -s "$TARGET_DEV" mkpart primary fat32 257MiB 100%
 
 echo "Marking partition 1 as bootable (active)..."
 parted -s "$TARGET_DEV" set 1 boot on
