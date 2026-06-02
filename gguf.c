@@ -137,6 +137,10 @@ static uint32_t embedding_length = 0;
 static uint32_t feed_forward_length = 0;
 static uint32_t head_count = 0;
 static uint32_t head_count_kv = 0;
+static uint32_t head_dim = 0;        // Detected from tensor dims (Q/K/V head dimension)
+static uint32_t head_dim_q = 0;      // Q head dimension (may differ from head_dim for QKNorm models)
+static uint32_t q_hidden_dim = 0;    // Q projection output dimension
+static uint32_t kv_hidden_dim = 0;   // K/V projection output dimension
 static float layer_norm_rms_epsilon = 1e-5f;
 
 // Model Weight Offsets/Pointers
@@ -150,6 +154,14 @@ struct layer_weights {
     void* attn_output;
     int type_output;
     float* attn_norm;
+    // Qwen3-style Q/K normalization weights
+    float* attn_q_norm;
+    float* attn_k_norm;
+    // Qwen2.5-style biases
+    float* attn_q_bias;
+    float* attn_k_bias;
+    float* attn_v_bias;
+    // FFN weights
     void* ffn_gate;
     int type_gate;
     void* ffn_up;
@@ -637,6 +649,14 @@ int gguf_init(void* model_buffer, size_t model_size) {
         head_count_kv = head_count;
     }
     
+    // Allocate dynamic buffers for forward pass
+    // Note: Q, K, V may have different dimensions than embedding_length for models like Qwen3
+    // Default: head_dim = embedding_length / head_count
+    head_dim = embedding_length / head_count;
+    head_dim_q = head_dim;  // Same by default
+    q_hidden_dim = head_count * head_dim;
+    kv_hidden_dim = head_count_kv * head_dim;
+    
     serial_printf("GGUF Params:\n");
     serial_printf("  - Block Count: %d\n", block_count);
     serial_printf("  - Context Length: %d\n", context_length);
@@ -673,6 +693,42 @@ int gguf_init(void* model_buffer, size_t model_size) {
         tensors[i].data = tensor_data_block + tensors[i].offset;
     }
     
+    // Detect head dimensions from tensor shapes (for Qwen3-style models with Q/K norm)
+    // Check layer 0's Q/K norm weight dimensions
+    char test_name[64];
+    make_layer_tensor_name(test_name, 0, "attn_q_norm.weight");
+    for (int i = 0; i < tensor_count; i++) {
+        if (key_match(tensors[i].name, tensors[i].name_len, test_name)) {
+            if (tensors[i].n_dims >= 1) {
+                head_dim_q = tensors[i].dims[0];
+                // If it's head_count * head_dim, divide
+                if (head_dim_q > embedding_length) {
+                    head_dim_q = head_dim_q / head_count;
+                }
+            }
+            break;
+        }
+    }
+    make_layer_tensor_name(test_name, 0, "attn_k_norm.weight");
+    for (int i = 0; i < tensor_count; i++) {
+        if (key_match(tensors[i].name, tensors[i].name_len, test_name)) {
+            if (tensors[i].n_dims >= 1) {
+                head_dim = tensors[i].dims[0];
+                if (head_dim > embedding_length) {
+                    head_dim = head_dim / head_count_kv;
+                }
+            }
+            break;
+        }
+    }
+    
+    // Recalculate projection dimensions
+    q_hidden_dim = head_count * head_dim_q;
+    kv_hidden_dim = head_count_kv * head_dim;
+    
+    serial_printf("GGUF: Detected Head Dim: %d (Q: %d)\n", head_dim, head_dim_q);
+    serial_printf("GGUF: Q Hidden Dim: %d, KV Hidden Dim: %d\n", q_hidden_dim, kv_hidden_dim);
+    
     // Link weight structures
     model.token_embd = find_tensor_data("token_embd.weight");
     model.type_embd = find_tensor_type("token_embd.weight");
@@ -707,6 +763,23 @@ int gguf_init(void* model_buffer, size_t model_size) {
         make_layer_tensor_name(name_buf, l, "attn_norm.weight");
         model.layers[l].attn_norm = (float*)find_tensor_data(name_buf);
         
+        // Qwen3-style Q/K normalization
+        make_layer_tensor_name(name_buf, l, "attn_q_norm.weight");
+        model.layers[l].attn_q_norm = (float*)find_tensor_data(name_buf);
+        
+        make_layer_tensor_name(name_buf, l, "attn_k_norm.weight");
+        model.layers[l].attn_k_norm = (float*)find_tensor_data(name_buf);
+        
+        // Qwen2.5-style biases
+        make_layer_tensor_name(name_buf, l, "attn_q.bias");
+        model.layers[l].attn_q_bias = (float*)find_tensor_data(name_buf);
+        
+        make_layer_tensor_name(name_buf, l, "attn_k.bias");
+        model.layers[l].attn_k_bias = (float*)find_tensor_data(name_buf);
+        
+        make_layer_tensor_name(name_buf, l, "attn_v.bias");
+        model.layers[l].attn_v_bias = (float*)find_tensor_data(name_buf);
+        
         make_layer_tensor_name(name_buf, l, "ffn_gate.weight");
         model.layers[l].ffn_gate = find_tensor_data(name_buf);
         model.layers[l].type_gate = find_tensor_type(name_buf);
@@ -724,22 +797,39 @@ int gguf_init(void* model_buffer, size_t model_size) {
     }
     
     // Allocate dynamic buffers for forward pass
+    // Note: Q, K, V may have different dimensions than embedding_length for models like Qwen3
+    
+    // Limit context length to fit in available memory
+    // KV cache = block_count * context_length * kv_hidden_dim * 4 bytes * 2 (K+V)
+    // We want to keep total memory under ~2GB for KV cache
+    uint64_t kv_cache_size = (uint64_t)block_count * context_length * kv_hidden_dim * sizeof(float) * 2;
+    uint64_t max_kv_cache = 2ULL * 1024 * 1024 * 1024;  // 2GB max for KV cache
+    if (kv_cache_size > max_kv_cache) {
+        uint64_t new_ctx = max_kv_cache / (block_count * kv_hidden_dim * sizeof(float) * 2);
+        // Round down to power of 2 for cleaner arithmetic
+        uint64_t pow2 = 1;
+        while (pow2 * 2 <= new_ctx) pow2 *= 2;
+        new_ctx = pow2;
+        if (new_ctx < 256) new_ctx = 256;  // Minimum context
+        serial_printf("GGUF: Reducing context_length from %d to %llu (memory limit)\n", context_length, (unsigned long long)new_ctx);
+        context_length = (uint32_t)new_ctx;
+    }
+    
     d_x = (float*)malloc(embedding_length * sizeof(float));
     d_x_norm = (float*)malloc(embedding_length * sizeof(float));
-    d_q = (float*)malloc(embedding_length * sizeof(float));
-    d_k = (float*)malloc(embedding_length * sizeof(float));
-    d_v = (float*)malloc(embedding_length * sizeof(float));
+    d_q = (float*)malloc(q_hidden_dim * sizeof(float));       // Q projects to q_hidden_dim
+    d_k = (float*)malloc(kv_hidden_dim * sizeof(float));       // K projects to kv_hidden_dim
+    d_v = (float*)malloc(kv_hidden_dim * sizeof(float));       // V projects to kv_hidden_dim
     d_scores = (float*)malloc(context_length * sizeof(float));
-    d_attn_out = (float*)malloc(embedding_length * sizeof(float));
+    d_attn_out = (float*)malloc(head_count * head_dim * sizeof(float)); // Concatenated attention outputs
     d_gate = (float*)malloc(feed_forward_length * sizeof(float));
     d_up = (float*)malloc(feed_forward_length * sizeof(float));
     d_ffn = (float*)malloc(feed_forward_length * sizeof(float));
     d_logits = (float*)malloc(vocab_size * sizeof(float));
     
-    int head_dim = embedding_length / head_count;
-    int dim_kv = head_count_kv * head_dim;
-    d_k_cache = (float*)malloc(block_count * context_length * dim_kv * sizeof(float));
-    d_v_cache = (float*)malloc(block_count * context_length * dim_kv * sizeof(float));
+    // KV cache uses kv_hidden_dim
+    d_k_cache = (float*)malloc((size_t)block_count * context_length * kv_hidden_dim * sizeof(float));
+    d_v_cache = (float*)malloc((size_t)block_count * context_length * kv_hidden_dim * sizeof(float));
     
     if (!d_x || !d_logits || !d_k_cache || !d_v_cache) {
         serial_printf("GGUF ERROR: Failed to allocate model execution memory buffers!\n");
@@ -958,8 +1048,6 @@ static void rmsnorm(float* o, const float* x, const float* weight, int size) {
 // Transformer layer forward pass
 static void transformer_forward(int token_id, int pos) {
     int dim = embedding_length;
-    int head_dim = dim / head_count;
-    int dim_kv = head_count_kv * head_dim;
     int group_size = head_count / head_count_kv;
     
     // 1. Token Embeddings
@@ -977,21 +1065,68 @@ static void transformer_forward(int token_id, int pos) {
         rmsnorm(d_x_norm, d_x, model.layers[l].attn_norm, dim);
         
         // Q, K, V Projections
-        mat_vec_mul(d_q, model.layers[l].attn_q, d_x_norm, dim, dim, model.layers[l].type_q);
-        mat_vec_mul(d_k, model.layers[l].attn_k, d_x_norm, dim_kv, dim, model.layers[l].type_k);
-        mat_vec_mul(d_v, model.layers[l].attn_v, d_x_norm, dim_kv, dim, model.layers[l].type_v);
+        // Q: embedding_length -> q_hidden_dim
+        // K,V: embedding_length -> kv_hidden_dim
+        mat_vec_mul(d_q, model.layers[l].attn_q, d_x_norm, q_hidden_dim, dim, model.layers[l].type_q);
+        mat_vec_mul(d_k, model.layers[l].attn_k, d_x_norm, kv_hidden_dim, dim, model.layers[l].type_k);
+        mat_vec_mul(d_v, model.layers[l].attn_v, d_x_norm, kv_hidden_dim, dim, model.layers[l].type_v);
+        
+        // Add biases if present (Qwen2.5-style)
+        if (model.layers[l].attn_q_bias) {
+            for (uint32_t i = 0; i < q_hidden_dim; i++) {
+                d_q[i] += model.layers[l].attn_q_bias[i];
+            }
+        }
+        if (model.layers[l].attn_k_bias) {
+            for (uint32_t i = 0; i < kv_hidden_dim; i++) {
+                d_k[i] += model.layers[l].attn_k_bias[i];
+            }
+        }
+        if (model.layers[l].attn_v_bias) {
+            for (uint32_t i = 0; i < kv_hidden_dim; i++) {
+                d_v[i] += model.layers[l].attn_v_bias[i];
+            }
+        }
+        
+        // Apply Q/K normalization if present (Qwen3-style)
+        if (model.layers[l].attn_q_norm) {
+            for (uint32_t h = 0; h < head_count; h++) {
+                float* q_head = d_q + h * head_dim_q;
+                float sum = 0.0f;
+                for (uint32_t i = 0; i < head_dim_q; i++) {
+                    sum += q_head[i] * q_head[i];
+                }
+                float scale = 1.0f / (float)sqrt((double)(sum / head_dim_q) + layer_norm_rms_epsilon);
+                for (uint32_t i = 0; i < head_dim_q; i++) {
+                    q_head[i] = q_head[i] * scale * model.layers[l].attn_q_norm[i];
+                }
+            }
+        }
+        if (model.layers[l].attn_k_norm) {
+            for (uint32_t h = 0; h < head_count_kv; h++) {
+                float* k_head = d_k + h * head_dim;
+                float sum = 0.0f;
+                for (uint32_t i = 0; i < head_dim; i++) {
+                    sum += k_head[i] * k_head[i];
+                }
+                float scale = 1.0f / (float)sqrt((double)(sum / head_dim) + layer_norm_rms_epsilon);
+                for (uint32_t i = 0; i < head_dim; i++) {
+                    k_head[i] = k_head[i] * scale * model.layers[l].attn_k_norm[i];
+                }
+            }
+        }
         
         // Rotary Position Embeddings (RoPE)
-        // Q RoPE
+        // Q RoPE - uses head_dim_q for each head
         for (uint32_t h = 0; h < head_count; h++) {
-            for (int i = 0; i < head_dim; i += 2) {
-                double freq = 1.0 / pow(10000.0, (double)i / (double)head_dim);
+            for (uint32_t i = 0; i < head_dim_q; i += 2) {
+                double freq = 1.0 / pow(10000.0, (double)i / (double)head_dim_q);
                 double theta = (double)pos * freq;
                 float cos_theta = cos(theta);
                 float sin_theta = sin(theta);
                 
-                int idx1 = h * head_dim + i;
-                int idx2 = h * head_dim + i + 1;
+                int idx1 = h * head_dim_q + i;
+                int idx2 = h * head_dim_q + i + 1;
                 
                 float q1 = d_q[idx1];
                 float q2 = d_q[idx2];
@@ -999,9 +1134,9 @@ static void transformer_forward(int token_id, int pos) {
                 d_q[idx2] = q1 * sin_theta + q2 * cos_theta;
             }
         }
-        // K RoPE
+        // K RoPE - uses head_dim for KV heads
         for (uint32_t h = 0; h < head_count_kv; h++) {
-            for (int i = 0; i < head_dim; i += 2) {
+            for (uint32_t i = 0; i < head_dim; i += 2) {
                 double freq = 1.0 / pow(10000.0, (double)i / (double)head_dim);
                 double theta = (double)pos * freq;
                 float cos_theta = cos(theta);
@@ -1018,22 +1153,22 @@ static void transformer_forward(int token_id, int pos) {
         }
         
         // Write K, V cache for this token
-        uint64_t cache_offset = (l * context_length * dim_kv) + (pos * dim_kv);
-        memcpy(d_k_cache + cache_offset, d_k, dim_kv * sizeof(float));
-        memcpy(d_v_cache + cache_offset, d_v, dim_kv * sizeof(float));
+        uint64_t cache_offset = (l * context_length * kv_hidden_dim) + (pos * kv_hidden_dim);
+        memcpy(d_k_cache + cache_offset, d_k, kv_hidden_dim * sizeof(float));
+        memcpy(d_v_cache + cache_offset, d_v, kv_hidden_dim * sizeof(float));
         
         // Multi-head Attention
-        // Divide into heads
-        float scale = 1.0f / (float)sqrt((double)head_dim);
+        // For GQA: group_size = head_count / head_count_kv
+        float scale = 1.0f / (float)sqrt((double)head_dim_q);  // Scale by Q head dim
         for (uint32_t h = 0; h < head_count; h++) {
-            float* q_head = d_q + h * head_dim;
-            uint32_t kv_h = h / group_size;
+            float* q_head = d_q + h * head_dim_q;
+            uint32_t kv_h = h / group_size;  // Which KV head this Q head uses
             
             // Calculate attention scores for all previous positions
             for (int p = 0; p <= pos; p++) {
-                float* k_cached = d_k_cache + (l * context_length * dim_kv) + (p * dim_kv) + kv_h * head_dim;
+                float* k_cached = d_k_cache + (l * context_length * kv_hidden_dim) + (p * kv_hidden_dim) + kv_h * head_dim;
                 float score = 0.0f;
-                for (int i = 0; i < head_dim; i++) {
+                for (uint32_t i = 0; i < head_dim; i++) {
                     score += q_head[i] * k_cached[i];
                 }
                 d_scores[p] = score * scale;
@@ -1056,22 +1191,23 @@ static void transformer_forward(int token_id, int pos) {
             
             // Compute head output vector
             float* out_head = d_attn_out + h * head_dim;
-            for (int i = 0; i < head_dim; i++) {
+            for (uint32_t i = 0; i < head_dim; i++) {
                 out_head[i] = 0.0f;
             }
             
             for (int p = 0; p <= pos; p++) {
-                float* v_cached = d_v_cache + (l * context_length * dim_kv) + (p * dim_kv) + kv_h * head_dim;
+                float* v_cached = d_v_cache + (l * context_length * kv_hidden_dim) + (p * kv_hidden_dim) + kv_h * head_dim;
                 float attn_weight = d_scores[p];
-                for (int i = 0; i < head_dim; i++) {
+                for (uint32_t i = 0; i < head_dim; i++) {
                     out_head[i] += attn_weight * v_cached[i];
                 }
             }
         }
         
-        // Attention Output projection
-        float* x_attn = d_q; // reuse buffer
-        mat_vec_mul(x_attn, model.layers[l].attn_output, d_attn_out, dim, dim, model.layers[l].type_output);
+        // Attention Output projection: (head_count * head_dim) -> embedding_length
+        float* x_attn = d_q;  // reuse buffer (large enough to hold embedding_length)
+        int attn_out_dim = head_count * head_dim;
+        mat_vec_mul(x_attn, model.layers[l].attn_output, d_attn_out, dim, attn_out_dim, model.layers[l].type_output);
         
         // Residual addition
         for (int i = 0; i < dim; i++) {
@@ -1207,12 +1343,19 @@ void gguf_generate(const char* prompt, int max_tokens, void (*token_callback)(co
     rng_state = (uint32_t)rdtsc();
     if (rng_state == 0) rng_state = 123456789;
     
-    // 1. Process prompt tokens sequentially to populate KV cache
+    // Prefill with progress every token for first 10 positions, then every 10 tokens
     int last_token = tokens[0];
+    serial_printf("\nGGUF: Prefill %d tokens\n", n_tokens - 1);
+    serial_printf("GGUF Debug: layers=%d, heads=%d/%d, dim=%d/%d/%d\n",
+                 block_count, head_count, head_count_kv, head_dim, head_dim_q, kv_hidden_dim);
     for (int i = 0; i < n_tokens - 1; i++) {
         transformer_forward(tokens[i], i);
         last_token = tokens[i + 1];
+        if (i < 10 || (i + 1) % 10 == 0) {
+            serial_printf("%d%s", i + 1, (i + 1) % 50 == 0 ? "\n" : " ");
+        }
     }
+    serial_printf("\nGGUF: Prefill complete\n");
     
     // 2. Generate new tokens
     int pos = n_tokens - 1;
